@@ -148,6 +148,4 @@ Feedback is especially useful from administrators running:
 
 When reporting an issue, include the Zabbix version, MSA model, controller firmware and the exact unsupported-item error. Remove hostnames, addresses, serial numbers and credentials before sharing API output.
 
-## License
 
-Choose and add a license before publishing the repository. MIT is a practical option for a community Zabbix template.
