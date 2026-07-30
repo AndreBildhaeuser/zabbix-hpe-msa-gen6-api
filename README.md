@@ -1,4 +1,5 @@
 # zabbix-hpe-msa-gen6-api
+# HPE MSA Gen6 API Monitoring Template for Zabbix
 
 Native health and availability monitoring for HPE MSA Gen6 storage systems using the web-management API.
 
