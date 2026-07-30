@@ -1,0 +1,2628 @@
+zabbix_export:
+  version: '7.4'
+  template_groups:
+  - uuid: 7df96b18c230490a9a0a9e2307226338
+    name: Templates
+  templates:
+  - uuid: c80fde5074c0472999c0e6090af762aa
+    template: HPE MSA API
+    name: HPE MSA API
+    groups:
+    - name: Templates
+    items:
+    - uuid: 5f18cdcd926b4110a8f427410e6ad558
+      name: 'HPE MSA: Get disks via API'
+      type: SCRIPT
+      key: hpe.msa.api.disks.raw
+      delay: 5m
+      history: 1d
+      value_type: TEXT
+      params: |
+        var params = JSON.parse(value);
+
+
+        function fail(message) {
+            throw 'HPE MSA API: ' + message;
+        }
+
+
+        function checkHttpStatus(request, operation) {
+            var status = request.getStatus();
+
+            if (status < 200 || status >= 300) {
+                fail(operation + ' returned HTTP status ' + status);
+            }
+        }
+
+
+        function extractProperty(xml, propertyName) {
+            var pattern = new RegExp(
+                '<PROPERTY[^>]+name="' + propertyName +
+                '"[^>]*>([^<]*)<\\/PROPERTY>'
+            );
+
+            var match = xml.match(pattern);
+
+            if (match === null || match.length < 2) {
+                fail(
+                    'Property "' + propertyName +
+                    '" not found in response: ' + xml
+                );
+            }
+
+            return match[1];
+        }
+
+
+        function decodeApiString(text) {
+            return text
+                .replace(/\\"/g, '"')
+                .replace(/\\\\/g, '\\')
+                .replace(/\\n/g, '\n')
+                .replace(/\\r/g, '\r')
+                .replace(/\\t/g, '\t');
+        }
+
+
+        function convertValue(name, rawValue) {
+            var value = decodeApiString(rawValue);
+
+            /*
+             * Die API liefert für viele Werte bereits ein zusätzliches
+             * Feld mit dem Suffix "-numeric". Diese Werte wandeln wir
+             * in echte Zahlen um, sofern das verlustfrei möglich ist.
+             */
+            if (/-numeric$/.test(name)) {
+                if (/^-?\d+$/.test(value)) {
+                    return parseInt(value, 10);
+                }
+
+                if (/^-?\d+\.\d+$/.test(value)) {
+                    return parseFloat(value);
+                }
+            }
+
+            /*
+             * Einige eindeutig numerische Felder besitzen kein
+             * "-numeric"-Gegenstück.
+             */
+            if (
+                name === 'slot' ||
+                name === 'enclosure-id' ||
+                name === 'drawer-id' ||
+                name === 'port' ||
+                name === 'scsi-id' ||
+                name === 'blocksize' ||
+                name === 'blocks' ||
+                name === 'index' ||
+                name === 'power-on-hours' ||
+                name === 'number-of-ios' ||
+                name === 'avg-rsp-time' ||
+                name === 'num-depopped-heads'
+            ) {
+                if (/^-?\d+$/.test(value)) {
+                    return parseInt(value, 10);
+                }
+            }
+
+            return value;
+        }
+
+
+        function parseDrives(apiResponse) {
+            var drives = [];
+
+            /*
+             * Jeder Laufwerksblock endet unmittelbar vor dem
+             * Metadatenobjekt:
+             *
+             * {basetype:"drives",name:"drive",oid:"1"}
+             */
+            var drivePattern =
+                /new APIDrives\(\[([\s\S]*?)\]\s*,?\s*\{basetype:"drives",name:"drive",oid:"([^"]+)"\}\)/g;
+
+            var driveMatch;
+
+            while ((driveMatch = drivePattern.exec(apiResponse)) !== null) {
+                var propertyText = driveMatch[1];
+                var objectId = driveMatch[2];
+
+                var drive = {
+                    "_oid": objectId
+                };
+
+                var propertyPattern =
+                    /new APIProp\(\{name:"((?:\\.|[^"])*)",value:"((?:\\.|[^"])*)"\}\)/g;
+
+                var propertyMatch;
+
+                while (
+                    (propertyMatch = propertyPattern.exec(propertyText)) !== null
+                ) {
+                    var name = decodeApiString(propertyMatch[1]);
+                    var propertyValue = convertValue(
+                        name,
+                        propertyMatch[2]
+                    );
+
+                    drive[name] = propertyValue;
+                }
+
+                if (!drive['durable-id']) {
+                    fail(
+                        'Parsed drive block "' + objectId +
+                        '" contains no durable-id.'
+                    );
+                }
+
+                drives.push(drive);
+            }
+
+            if (drives.length === 0) {
+                fail(
+                    'No drives could be parsed from API response. ' +
+                    'Response starts with: ' +
+                    apiResponse.substring(0, 300)
+                );
+            }
+
+            return drives;
+        }
+
+
+        if (!params.scheme || !params.host || !params.port) {
+            fail('Scheme, host or port is missing.');
+        }
+
+        if (!params.username || !params.password) {
+            fail('Username or password is missing.');
+        }
+
+
+        var baseUrl =
+            params.scheme + '://' +
+            params.host + ':' +
+            params.port;
+
+
+        var loginHash = sha256(
+            params.username + '_' + params.password
+        );
+
+
+        var loginRequest = new HttpRequest();
+
+        var loginResponse = loginRequest.get(
+            baseUrl + '/api/login/' + loginHash
+        );
+
+        checkHttpStatus(loginRequest, 'Login');
+
+
+        var responseType = extractProperty(
+            loginResponse,
+            'response-type'
+        );
+
+        if (responseType !== 'Success') {
+            fail('Login failed: ' + loginResponse);
+        }
+
+
+        var sessionKey = extractProperty(
+            loginResponse,
+            'response'
+        );
+
+
+        var disksRequest = new HttpRequest();
+
+        disksRequest.addHeader(
+            'sessionkey: ' + sessionKey
+        );
+
+        disksRequest.addHeader(
+            'datatype: wbi'
+        );
+
+        disksRequest.addHeader(
+            'Cookie: wbisessionkey=' + sessionKey +
+            '; wbiusername=' + params.username
+        );
+
+
+        var disksResponse = disksRequest.get(
+            baseUrl + '/api/show/disks'
+        );
+
+        checkHttpStatus(disksRequest, 'Get disks');
+
+
+        if (disksResponse.indexOf('Invalid sessionkey') !== -1) {
+            fail('MSA rejected the generated session key.');
+        }
+
+
+        var result = {
+            "drives": parseDrives(disksResponse)
+        };
+
+
+        return JSON.stringify(result);
+      timeout: 30s
+      parameters:
+      - name: host
+        value: '{$HPE.MSA.API.HOST}'
+      - name: password
+        value: '{$HPE.MSA.API.PASSWORD}'
+      - name: port
+        value: '{$HPE.MSA.API.PORT}'
+      - name: scheme
+        value: '{$HPE.MSA.API.SCHEME}'
+      - name: username
+        value: '{$HPE.MSA.API.USER}'
+      tags:
+      - tag: component
+        value: raw
+      triggers:
+      - uuid: 7108c060d37e4cf78a62e9c3daae7b2b
+        expression: nodata(/HPE MSA API/hpe.msa.api.disks.raw,{$HPE.MSA.API.NODATA})=1
+        name: 'HPE MSA: Disk API data is unavailable'
+        priority: AVERAGE
+        description: The disk endpoint has not delivered data although the main API may still be reachable.
+        dependencies:
+        - name: 'HPE MSA: Management API is unavailable'
+          expression: nodata(/HPE MSA API/hpe.msa.api.enclosures,{$HPE.MSA.API.NODATA})=1
+        tags:
+        - tag: component
+          value: availability
+        - tag: scope
+          value: availability
+    - uuid: 2250b1d1b8ea43aa994a958070bb0987
+      name: 'HPE MSA: Get enclosure hardware via API'
+      type: SCRIPT
+      key: hpe.msa.api.enclosures
+      delay: 5m
+      value_type: TEXT
+      params: |
+        var params = JSON.parse(value);
+
+
+        /*
+         * Einheitlicher Fehlerpräfix, damit man in Zabbix sofort erkennt,
+         * aus welchem Script eine Meldung stammt.
+         */
+        function fail(message) {
+            throw 'HPE MSA API: ' + message;
+        }
+
+
+        /*
+         * Prüft den HTTP-Status des zuletzt ausgeführten Requests.
+         */
+        function checkHttpStatus(request, operation) {
+            var status = request.getStatus();
+
+            if (status < 200 || status >= 300) {
+                fail(operation + ' returned HTTP status ' + status);
+            }
+        }
+
+
+        /*
+         * Liest eine PROPERTY aus der XML-Antwort des Login-Endpunkts.
+         */
+        function extractXmlProperty(xml, propertyName) {
+            var pattern = new RegExp(
+                '<PROPERTY[^>]+name="' + propertyName +
+                '"[^>]*>([^<]*)<\\/PROPERTY>'
+            );
+
+            var match = xml.match(pattern);
+
+            if (match === null || match.length < 2) {
+                fail(
+                    'Property "' + propertyName +
+                    '" not found in login response.'
+                );
+            }
+
+            return match[1];
+        }
+
+
+        /*
+         * Entfernt Escapes aus den HPE-API-Strings.
+         */
+        function decodeApiString(text) {
+            return text
+                .replace(/\\"/g, '"')
+                .replace(/\\\\/g, '\\')
+                .replace(/\\n/g, '\n')
+                .replace(/\\r/g, '\r')
+                .replace(/\\t/g, '\t');
+        }
+
+
+        /*
+         * Wandelt geeignete Werte in echte Zahlen um.
+         *
+         * Nicht jeder String, der nur aus Ziffern besteht, darf blind
+         * konvertiert werden: Firmware "0303" soll beispielsweise
+         * weiterhin "0303" bleiben.
+         */
+        function convertValue(name, rawValue) {
+            var parsedValue = decodeApiString(rawValue);
+
+            /*
+             * Felder mit "-numeric" sind von der API ausdrücklich
+             * als numerische Entsprechung vorgesehen.
+             */
+            if (/-numeric$/.test(name)) {
+                if (/^-?\d+$/.test(parsedValue)) {
+                    return parseInt(parsedValue, 10);
+                }
+
+                if (/^-?\d+\.\d+$/.test(parsedValue)) {
+                    return parseFloat(parsedValue);
+                }
+            }
+
+            /*
+             * Bekannte Mess- und Mengenfelder ohne "-numeric".
+             */
+            if (
+                name === 'enclosure-id' ||
+                name === 'dom-id' ||
+                name === 'rack-number' ||
+                name === 'rack-position' ||
+                name === 'number-of-coolings-elements' ||
+                name === 'number-of-disks' ||
+                name === 'number-of-power-supplies' ||
+                name === 'rows' ||
+                name === 'columns' ||
+                name === 'slots' ||
+                name === 'enclosure-power' ||
+                name === 'disks' ||
+                name === 'number-of-storage-pools' ||
+                name === 'virtual-disks' ||
+                name === 'cache-memory-size' ||
+                name === 'system-memory-size' ||
+                name === 'host-ports' ||
+                name === 'drive-channels' ||
+                name === 'fan-out' ||
+                name === 'width' ||
+                name === 'sas-lanes-expected' ||
+                name === 'sas-active-lanes' ||
+                name === 'sas-disabled-lanes' ||
+                name === 'speed'
+            ) {
+                if (/^-?\d+$/.test(parsedValue)) {
+                    return parseInt(parsedValue, 10);
+                }
+
+                if (/^-?\d+\.\d+$/.test(parsedValue)) {
+                    return parseFloat(parsedValue);
+                }
+            }
+
+            return parsedValue;
+        }
+
+
+        /*
+         * Liest alle Objekte eines bestimmten HPE-Konstruktortyps.
+         *
+         * Beispiel:
+         *   parseApiObjects(response, 'APIFan')
+         *
+         * liefert alle direkt am Anfang jedes APIFan-Blocks stehenden
+         * APIProp-Werte. Verschachtelte Objekte werden separat geparst
+         * und nicht versehentlich dem Elternobjekt zugeschlagen.
+         */
+        function parseApiObjects(apiResponse, constructorName) {
+            var objects = [];
+
+            var objectPattern = new RegExp(
+                'new\\s+' + constructorName +
+                '\\(\\[\\s*' +
+                '((?:new\\s+APIProp\\(' +
+                '\\{name:"(?:\\\\.|[^"])*",' +
+                'value:"(?:\\\\.|[^"])*"\\}' +
+                '\\),?\\s*)+)',
+                'g'
+            );
+
+            var propertyPattern =
+                /new\s+APIProp\(\{name:"((?:\\.|[^"])*)",value:"((?:\\.|[^"])*)"\}\)/g;
+
+            var objectMatch;
+
+            while (
+                (objectMatch = objectPattern.exec(apiResponse)) !== null
+            ) {
+                var propertyText = objectMatch[1];
+                var object = {};
+                var propertyMatch;
+
+                propertyPattern.lastIndex = 0;
+
+                while (
+                    (propertyMatch = propertyPattern.exec(propertyText)) !== null
+                ) {
+                    var propertyName = decodeApiString(
+                        propertyMatch[1]
+                    );
+
+                    object[propertyName] = convertValue(
+                        propertyName,
+                        propertyMatch[2]
+                    );
+                }
+
+                /*
+                 * Alle für uns relevanten Hardwareobjekte besitzen
+                 * eine durable-id. Damit ignorieren wir unvollständige
+                 * oder unerwartete Treffer.
+                 */
+                if (object['durable-id']) {
+                    objects.push(object);
+                }
+            }
+
+            return objects;
+        }
+
+
+        /*
+         * Pflichtparameter prüfen.
+         */
+        if (!params.scheme || !params.host || !params.port) {
+            fail('Scheme, host or port is missing.');
+        }
+
+        if (!params.username || !params.password) {
+            fail('Username or password is missing.');
+        }
+
+
+        /*
+         * Basis-URL und Login-Hash erzeugen.
+         */
+        var baseUrl =
+            params.scheme + '://' +
+            params.host + ':' +
+            params.port;
+
+        var loginHash = sha256(
+            params.username + '_' + params.password
+        );
+
+
+        /*
+         * Anmeldung an der MSA.
+         */
+        var loginRequest = new HttpRequest();
+
+        var loginResponse = loginRequest.get(
+            baseUrl + '/api/login/' + loginHash
+        );
+
+        checkHttpStatus(
+            loginRequest,
+            'Login'
+        );
+
+
+        var responseType = extractXmlProperty(
+            loginResponse,
+            'response-type'
+        );
+
+        if (responseType !== 'Success') {
+            fail('Login failed: ' + loginResponse);
+        }
+
+
+        var sessionKey = extractXmlProperty(
+            loginResponse,
+            'response'
+        );
+
+
+        /*
+         * Enclosure-Hardware abrufen.
+         */
+        var hardwareRequest = new HttpRequest();
+
+        hardwareRequest.addHeader(
+            'sessionkey: ' + sessionKey
+        );
+
+        hardwareRequest.addHeader(
+            'datatype: wbi'
+        );
+
+        hardwareRequest.addHeader(
+            'Cookie: wbisessionkey=' + sessionKey +
+            '; wbiusername=' + params.username
+        );
+
+
+        var hardwareResponse = hardwareRequest.get(
+            baseUrl + '/api/show/enclosures'
+        );
+
+        checkHttpStatus(
+            hardwareRequest,
+            'Get enclosure hardware'
+        );
+
+
+        if (
+            hardwareResponse.indexOf('Invalid sessionkey') !== -1
+        ) {
+            fail('MSA rejected the generated session key.');
+        }
+
+
+        /*
+         * Jeden verschachtelten Hardwaretyp in ein eigenes JSON-Array
+         * zerlegen. Dadurch kann später jede Discovery Rule einfach
+         * ihr passendes Array verwenden.
+         */
+        var result = {
+            enclosures: parseApiObjects(
+                hardwareResponse,
+                'APIEnclosures'
+            ),
+
+            controllers: parseApiObjects(
+                hardwareResponse,
+                'APIControllers'
+            ),
+
+            management_ports: parseApiObjects(
+                hardwareResponse,
+                'APINetworkParameters'
+            ),
+
+            host_ports: parseApiObjects(
+                hardwareResponse,
+                'APIPort'
+            ),
+
+            sas_port_details: parseApiObjects(
+                hardwareResponse,
+                'APISasPort'
+            ),
+
+            expansion_ports: parseApiObjects(
+                hardwareResponse,
+                'APIExpanderPorts'
+            ),
+
+            expanders: parseApiObjects(
+                hardwareResponse,
+                'APIExpanders'
+            ),
+
+            power_supplies: parseApiObjects(
+                hardwareResponse,
+                'APIPowerSupplies'
+            ),
+
+            fans: parseApiObjects(
+                hardwareResponse,
+                'APIFan'
+            )
+        };
+
+
+        /*
+         * Plausibilitätsprüfung.
+         */
+        if (result.enclosures.length === 0) {
+            fail(
+                'No enclosures could be parsed. Response starts with: ' +
+                hardwareResponse.substring(0, 300)
+            );
+        }
+
+        if (result.controllers.length === 0) {
+            fail('No controllers could be parsed.');
+        }
+
+        if (result.power_supplies.length === 0) {
+            fail('No power supplies could be parsed.');
+        }
+
+        if (result.fans.length === 0) {
+            fail('No fans could be parsed.');
+        }
+
+
+        return JSON.stringify(result);
+      parameters:
+      - name: host
+        value: '{$HPE.MSA.API.HOST}'
+      - name: password
+        value: '{$HPE.MSA.API.PASSWORD}'
+      - name: port
+        value: '{$HPE.MSA.API.PORT}'
+      - name: scheme
+        value: '{$HPE.MSA.API.SCHEME}'
+      - name: username
+        value: '{$HPE.MSA.API.USER}'
+      tags:
+      - tag: component
+        value: raw
+      history: 1d
+      triggers:
+      - uuid: 9e3291fd71a2424283f681cc52a97276
+        expression: nodata(/HPE MSA API/hpe.msa.api.enclosures,{$HPE.MSA.API.NODATA})=1
+        name: 'HPE MSA: Management API is unavailable'
+        priority: HIGH
+        description: No successful enclosure API response was received within the configured interval. Check credentials, HTTPS service and management
+          connectivity.
+        dependencies:
+        - name: 'HPE MSA: Device is unreachable by ICMP'
+          expression: max(/HPE MSA API/icmpping[{$HPE.MSA.API.HOST}],3m)=0
+        tags:
+        - tag: component
+          value: availability
+        - tag: scope
+          value: availability
+    - uuid: c280a717aeda46e48d8bc4a0ff1f4270
+      name: 'HPE MSA: ICMP ping'
+      type: SIMPLE
+      key: icmpping[{$HPE.MSA.API.HOST}]
+      delay: 1m
+      history: 7d
+      trends: 365d
+      description: Checks reachability of the MSA management address. Disable if ICMP is intentionally blocked.
+      tags:
+      - tag: component
+        value: availability
+      - tag: metric
+        value: ping
+      triggers:
+      - uuid: d79fe46bd68048288d9ba64b5f85aa1c
+        expression: max(/HPE MSA API/icmpping[{$HPE.MSA.API.HOST}],3m)=0
+        name: 'HPE MSA: Device is unreachable by ICMP'
+        priority: HIGH
+        description: No ICMP replies were received for three minutes. This may indicate a device, power or network outage.
+        tags:
+        - tag: component
+          value: availability
+        - tag: scope
+          value: availability
+    - uuid: d4e612e4d5b449d8a6ae8680f3c2e53c
+      name: 'HPE MSA: Get active alerts via API'
+      type: SCRIPT
+      key: hpe.msa.api.alerts
+      delay: 5m
+      history: 7d
+      value_type: TEXT
+      params: |-
+        var params = JSON.parse(value);
+
+        function fail(message) {
+            throw 'HPE MSA Alerts API: ' + message;
+        }
+
+        function checkHttpStatus(request, operation) {
+            var status = request.getStatus();
+            if (status < 200 || status >= 300) {
+                fail(operation + ' returned HTTP status ' + status);
+            }
+        }
+
+        function extractXmlProperty(xml, propertyName) {
+            var pattern = new RegExp(
+                '<PROPERTY[^>]+name="' + propertyName + '"[^>]*>([^<]*)<\\/PROPERTY>'
+            );
+            var match = xml.match(pattern);
+            if (match === null || match.length < 2) {
+                fail('Property "' + propertyName + '" not found in login response.');
+            }
+            return match[1];
+        }
+
+        function decodeApiString(text) {
+            return text
+                .replace(/\\"/g, '"')
+                .replace(/\\\\/g, '\\')
+                .replace(/\\n/g, '\n')
+                .replace(/\\r/g, '\r')
+                .replace(/\\t/g, '\t');
+        }
+
+        function convertValue(name, rawValue) {
+            var parsedValue = decodeApiString(rawValue);
+            if (/-numeric$/.test(name) || name === 'id' || name === 'hit-count') {
+                if (/^-?\d+$/.test(parsedValue)) {
+                    return parseInt(parsedValue, 10);
+                }
+            }
+            return parsedValue;
+        }
+
+        function parseApiObjects(apiResponse, constructorName) {
+            var objects = [];
+            var objectPattern = new RegExp(
+                'new\\s+' + constructorName + '\\(\\[\\s*' +
+                '((?:new\\s+APIProp\\(' +
+                '\\{name:"(?:\\\\.|[^"])*",' +
+                'value:"(?:\\\\.|[^"])*"\\}' +
+                '\\),?\\s*)+)',
+                'g'
+            );
+            var propertyPattern =
+                /new\s+APIProp\(\{name:"((?:\\.|[^"])*)",value:"((?:\\.|[^"])*)"\}\)/g;
+            var objectMatch;
+
+            while ((objectMatch = objectPattern.exec(apiResponse)) !== null) {
+                var object = {};
+                var propertyMatch;
+                propertyPattern.lastIndex = 0;
+                while ((propertyMatch = propertyPattern.exec(objectMatch[1])) !== null) {
+                    var propertyName = decodeApiString(propertyMatch[1]);
+                    object[propertyName] = convertValue(propertyName, propertyMatch[2]);
+                }
+                if (object['durable-id']) {
+                    objects.push(object);
+                }
+            }
+            return objects;
+        }
+
+        function plainText(text) {
+            if (!text) {
+                return '';
+            }
+            return text
+                .replace(/<br\s*\/?\s*>/gi, '\n')
+                .replace(/&nbsp;/gi, ' ')
+                .replace(/<[^>]+>/g, '')
+                .replace(/\s+\n/g, '\n')
+                .replace(/\n\s+/g, '\n')
+                .trim();
+        }
+
+        if (!params.scheme || !params.host || !params.port) {
+            fail('Scheme, host or port is missing.');
+        }
+        if (!params.username || !params.password) {
+            fail('Username or password is missing.');
+        }
+
+        var baseUrl = params.scheme + '://' + params.host + ':' + params.port;
+        var loginHash = sha256(params.username + '_' + params.password);
+        var loginRequest = new HttpRequest();
+        var loginResponse = loginRequest.get(baseUrl + '/api/login/' + loginHash);
+        checkHttpStatus(loginRequest, 'Login');
+
+        if (extractXmlProperty(loginResponse, 'response-type') !== 'Success') {
+            fail('Login failed.');
+        }
+        var sessionKey = extractXmlProperty(loginResponse, 'response');
+
+        var request = new HttpRequest();
+        request.addHeader('sessionkey: ' + sessionKey);
+        request.addHeader('datatype: wbi');
+        request.addHeader(
+            'Cookie: wbisessionkey=' + sessionKey + '; wbiusername=' + params.username
+        );
+        var response = request.get(baseUrl + '/api/show/alerts');
+        checkHttpStatus(request, 'Get alerts');
+        if (response.indexOf('Invalid sessionkey') !== -1) {
+            fail('MSA rejected the generated session key.');
+        }
+
+        var alerts = parseApiObjects(response, 'APIAlerts');
+        var active = [];
+        var counts = { informational: 0, warning: 0, critical: 0 };
+        var i;
+        for (i = 0; i < alerts.length; i++) {
+            if (alerts[i]['resolved-numeric'] === 0) {
+                alerts[i].reason = plainText(alerts[i].reason);
+                alerts[i]['recommended-action'] = plainText(alerts[i]['recommended-action']);
+                active.push(alerts[i]);
+                if (alerts[i]['severity-numeric'] === 3) {
+                    counts.critical++;
+                } else if (alerts[i]['severity-numeric'] === 1) {
+                    counts.warning++;
+                } else {
+                    counts.informational++;
+                }
+            }
+        }
+
+        active.sort(function (a, b) {
+            return (b['detected-time-numeric'] || 0) - (a['detected-time-numeric'] || 0);
+        });
+
+        var problems = active.filter(function (alert) {
+            return alert['severity-numeric'] >= 1;
+        });
+        var newest = problems.length > 0 ? problems[0] : {};
+        var summaryLines = [];
+        var recommendationLines = [];
+        for (i = 0; i < problems.length && i < 10; i++) {
+            summaryLines.push(
+                '[' + problems[i].severity + '] ' + problems[i].description +
+                ': ' + problems[i].reason
+            );
+            if (problems[i]['recommended-action']) {
+                recommendationLines.push(
+                    problems[i].description + ': ' + problems[i]['recommended-action']
+                );
+            }
+        }
+
+        return JSON.stringify({
+            summary: {
+                active_total: active.length,
+                active_informational: counts.informational,
+                active_warning: counts.warning,
+                active_critical: counts.critical,
+                active_problem_total: counts.warning + counts.critical,
+                problem_summary: summaryLines.join('\n'),
+                recommendations: recommendationLines.join('\n'),
+                newest_component: newest.component || '',
+                newest_description: newest.description || '',
+                newest_severity: newest.severity || '',
+                newest_reason: newest.reason || '',
+                newest_recommendation: newest['recommended-action'] || '',
+                newest_detected_time: newest['detected-time'] || ''
+            },
+            active_alerts: active,
+            active_problem_alerts: problems
+        });
+      timeout: 30s
+      parameters:
+      - name: host
+        value: '{$HPE.MSA.API.HOST}'
+      - name: password
+        value: '{$HPE.MSA.API.PASSWORD}'
+      - name: port
+        value: '{$HPE.MSA.API.PORT}'
+      - name: scheme
+        value: '{$HPE.MSA.API.SCHEME}'
+      - name: username
+        value: '{$HPE.MSA.API.USER}'
+      description: Retrieves MSA alerts, retains unresolved alerts and builds warning/critical summaries.
+      tags:
+      - tag: component
+        value: alerts
+      - tag: metric
+        value: raw
+      triggers:
+      - uuid: fe9dc8d2b34d4856a403fb4d317888d5
+        expression: nodata(/HPE MSA API/hpe.msa.api.alerts,{$HPE.MSA.ALERT.NODATA})=1
+        name: 'HPE MSA: Alert API data is unavailable'
+        priority: AVERAGE
+        description: The alerts endpoint has not delivered data within the configured interval.
+        dependencies:
+        - name: 'HPE MSA: Management API is unavailable'
+          expression: nodata(/HPE MSA API/hpe.msa.api.enclosures,{$HPE.MSA.API.NODATA})=1
+        tags:
+        - tag: component
+          value: availability
+        - tag: scope
+          value: availability
+    - uuid: c42c74428af0453aa7e96d7f99bc9607
+      name: 'HPE MSA: Active alerts total'
+      type: DEPENDENT
+      key: hpe.msa.alerts.active.total
+      history: 31d
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.active_total
+      master_item:
+        key: hpe.msa.api.alerts
+      tags:
+      - tag: component
+        value: alerts
+    - uuid: c14287a875b54f07b5cc9eff75ae3935
+      name: 'HPE MSA: Active informational alerts'
+      type: DEPENDENT
+      key: hpe.msa.alerts.active.informational
+      history: 31d
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.active_informational
+      master_item:
+        key: hpe.msa.api.alerts
+      tags:
+      - tag: component
+        value: alerts
+    - uuid: f6212a985aac45a8809b77ad7b6fc57b
+      name: 'HPE MSA: Active warning alerts'
+      type: DEPENDENT
+      key: hpe.msa.alerts.active.warning
+      history: 31d
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.active_warning
+      master_item:
+        key: hpe.msa.api.alerts
+      tags:
+      - tag: component
+        value: alerts
+      triggers:
+      - uuid: b44cbf0cd0cf4812b3eb51aeb3d71131
+        expression: last(/HPE MSA API/hpe.msa.alerts.active.warning)>0
+        name: 'HPE MSA: Active warning alert(s)'
+        event_name: 'HPE MSA: {ITEM.LASTVALUE1} active warning alert(s)'
+        priority: WARNING
+        opdata: 'Review HPE MSA: Active problem summary and recommended actions.'
+        dependencies:
+        - name: 'HPE MSA: Active critical alert(s)'
+          expression: last(/HPE MSA API/hpe.msa.alerts.active.critical)>0
+        tags:
+        - tag: component
+          value: alerts
+        - tag: scope
+          value: availability
+    - uuid: c9ac16dd3197445cab7a144c636f34b5
+      name: 'HPE MSA: Active critical alerts'
+      type: DEPENDENT
+      key: hpe.msa.alerts.active.critical
+      history: 31d
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.active_critical
+      master_item:
+        key: hpe.msa.api.alerts
+      tags:
+      - tag: component
+        value: alerts
+      triggers:
+      - uuid: 6fbbb7d7a3df496cbf54c6219e5b7686
+        expression: last(/HPE MSA API/hpe.msa.alerts.active.critical)>0
+        name: 'HPE MSA: Active critical alert(s)'
+        event_name: 'HPE MSA: {ITEM.LASTVALUE1} active critical alert(s)'
+        priority: HIGH
+        opdata: 'Review HPE MSA: Active problem summary and recommended actions.'
+        tags:
+        - tag: component
+          value: alerts
+        - tag: scope
+          value: availability
+    - uuid: 5f18de77a0dd40f4a4a47bda52b6e39a
+      name: 'HPE MSA: Active warning and critical alerts'
+      type: DEPENDENT
+      key: hpe.msa.alerts.active.problems
+      history: 31d
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.active_problem_total
+      master_item:
+        key: hpe.msa.api.alerts
+      tags:
+      - tag: component
+        value: alerts
+    - uuid: be811e0892bf4ec3a39aeacfe6142f66
+      name: 'HPE MSA: Active problem summary'
+      type: DEPENDENT
+      key: hpe.msa.alerts.problem.summary
+      history: 7d
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.problem_summary
+      master_item:
+        key: hpe.msa.api.alerts
+      tags:
+      - tag: component
+        value: alerts
+      value_type: TEXT
+    - uuid: f121e1d22189407d9e4c40e74045b1fd
+      name: 'HPE MSA: Active alert recommended actions'
+      type: DEPENDENT
+      key: hpe.msa.alerts.recommendations
+      history: 7d
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.recommendations
+      master_item:
+        key: hpe.msa.api.alerts
+      tags:
+      - tag: component
+        value: alerts
+      value_type: TEXT
+    - uuid: 63b2bc13ee894cda84a20e4bd74009cc
+      name: 'HPE MSA: Newest active problem component'
+      type: DEPENDENT
+      key: hpe.msa.alerts.newest.component
+      history: 7d
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.newest_component
+      master_item:
+        key: hpe.msa.api.alerts
+      tags:
+      - tag: component
+        value: alerts
+      value_type: TEXT
+    - uuid: 604aa3e6dbe74b4f8251dd41e725cbd0
+      name: 'HPE MSA: Newest active problem description'
+      type: DEPENDENT
+      key: hpe.msa.alerts.newest.description
+      history: 7d
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.newest_description
+      master_item:
+        key: hpe.msa.api.alerts
+      tags:
+      - tag: component
+        value: alerts
+      value_type: TEXT
+    - uuid: 2aa581b482a34ac09bcece7fcad27519
+      name: 'HPE MSA: Newest active problem severity'
+      type: DEPENDENT
+      key: hpe.msa.alerts.newest.severity
+      history: 7d
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.newest_severity
+      master_item:
+        key: hpe.msa.api.alerts
+      tags:
+      - tag: component
+        value: alerts
+      value_type: TEXT
+    - uuid: 7fc45772678545218f9795a67c0aeed9
+      name: 'HPE MSA: Newest active problem reason'
+      type: DEPENDENT
+      key: hpe.msa.alerts.newest.reason
+      history: 7d
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.newest_reason
+      master_item:
+        key: hpe.msa.api.alerts
+      tags:
+      - tag: component
+        value: alerts
+      value_type: TEXT
+    - uuid: 5993238b9a8547868d323d6df82a4170
+      name: 'HPE MSA: Newest active problem recommendation'
+      type: DEPENDENT
+      key: hpe.msa.alerts.newest.recommendation
+      history: 7d
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.newest_recommendation
+      master_item:
+        key: hpe.msa.api.alerts
+      tags:
+      - tag: component
+        value: alerts
+      value_type: TEXT
+    - uuid: 99319eb0d3b74c54a7021216ab089336
+      name: 'HPE MSA: Newest active problem detected time'
+      type: DEPENDENT
+      key: hpe.msa.alerts.newest.detected
+      history: 7d
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.newest_detected_time
+      master_item:
+        key: hpe.msa.api.alerts
+      tags:
+      - tag: component
+        value: alerts
+      value_type: TEXT
+    description: |-
+      Native health and availability monitoring for HPE MSA systems through the WBI API. No external scripts, agents or cron jobs are required. Includes hardware discovery, active alert aggregation and API availability checks. Tested on HPE MSA 1060 SAS with Zabbix 7.4.
+
+      Version 1.0.0: production release with hardware discovery, active alert aggregation, availability checks, HDD/SSD-specific discovery and corrected controller memory units.
+    discovery_rules:
+    - uuid: 005358a130e74299a7d67922bccdbc30
+      name: 'HPE MSA: Discover drives'
+      type: DEPENDENT
+      key: hpe.msa.drive.discovery
+      lifetime: 7d
+      enabled_lifetime_type: DISABLE_AFTER
+      enabled_lifetime: 1d
+      item_prototypes:
+      - uuid: 84adf357633449acad698932d04b7cfb
+        name: 'HPE MSA: Drive {#LOCATION}: Health'
+        type: DEPENDENT
+        key: hpe.msa.drive.health[{#DISKID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["health-numeric"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        trends: 365d
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: health
+        - &id001
+          tag: location
+          value: '{#LOCATION}'
+        - &id002
+          tag: architecture
+          value: '{#ARCHITECTURE}'
+        - &id003
+          tag: usage
+          value: '{#USAGE}'
+        trigger_prototypes:
+        - uuid: 4923db297a3d47d097390f24d374d32e
+          expression: last(/HPE MSA API/hpe.msa.drive.health[{#DISKID}])<>0
+          name: 'HPE MSA: Drive {#LOCATION} health is not OK'
+          priority: HIGH
+          tags:
+          - tag: component
+            value: drive
+          - tag: scope
+            value: availability
+      - uuid: ba52caa2d23c4e7f81534c6a27522b58
+        name: 'HPE MSA: Drive {#LOCATION}: Status'
+        type: DEPENDENT
+        key: hpe.msa.drive.status[{#DISKID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["status"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: status
+        - *id001
+        - *id002
+        - *id003
+        trigger_prototypes:
+        - uuid: 63bfb47879cc49e29aae022c93c35207
+          expression: last(/HPE MSA API/hpe.msa.drive.status[{#DISKID}])<>"Up"
+          name: 'HPE MSA: Drive {#LOCATION} status is not Up'
+          priority: HIGH
+          tags:
+          - tag: component
+            value: drive
+          - tag: scope
+            value: availability
+      - uuid: a94a42d1b2164008b0c54ea7c4c1c35a
+        name: 'HPE MSA: Drive {#LOCATION}: Temperature'
+        type: DEPENDENT
+        key: hpe.msa.drive.temperature[{#DISKID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["temperature-numeric"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        trends: 365d
+        units: °C
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: temperature
+        - *id001
+        - *id002
+        - *id003
+        trigger_prototypes:
+        - uuid: d25ed4f4cf3048c8a7ba671fad0ac4f2
+          expression: last(/HPE MSA API/hpe.msa.drive.temperature[{#DISKID}])>{$HPE.MSA.DRIVE.TEMP.CRIT}
+          name: 'HPE MSA: Drive {#LOCATION} temperature is critical'
+          priority: HIGH
+          tags:
+          - tag: component
+            value: drive
+          - tag: scope
+            value: performance
+        - uuid: 8474b5b1224f49cfb710d8996501a5fd
+          expression: last(/HPE MSA API/hpe.msa.drive.temperature[{#DISKID}])>{$HPE.MSA.DRIVE.TEMP.WARN}
+          name: 'HPE MSA: Drive {#LOCATION} temperature is high'
+          priority: WARNING
+          tags:
+          - tag: component
+            value: drive
+          - tag: scope
+            value: performance
+      - uuid: b167512c35ac4d6f9a17bbd8ac33cb59
+        name: 'HPE MSA: Drive {#LOCATION}: Model'
+        type: DEPENDENT
+        key: hpe.msa.drive.model[{#DISKID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["model"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: model
+        - *id001
+        - *id002
+        - *id003
+      - uuid: 0ad61c91c182468b8ba5a3e4b2a71631
+        name: 'HPE MSA: Drive {#LOCATION}: Serial number'
+        type: DEPENDENT
+        key: hpe.msa.drive.serial[{#DISKID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["serial-number"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: serial
+        - *id001
+        - *id002
+        - *id003
+      - uuid: 5b5d2c1026d54dc49517ba5f49ca21ff
+        name: 'HPE MSA: Drive {#LOCATION}: Architecture'
+        type: DEPENDENT
+        key: hpe.msa.drive.architecture[{#DISKID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["architecture"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: architecture
+        - *id001
+        - *id002
+        - *id003
+      - uuid: fdecb884d1df4faebbce15dbf709370a
+        name: 'HPE MSA: Drive {#LOCATION}: Usage'
+        type: DEPENDENT
+        key: hpe.msa.drive.usage[{#DISKID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["usage"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: usage
+        - *id001
+        - *id002
+        - *id003
+      - uuid: 76572ed160864c4e90a17557562d6702
+        name: 'HPE MSA: Drive {#LOCATION}: Storage pool'
+        type: DEPENDENT
+        key: hpe.msa.drive.pool[{#DISKID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["storage-pool-name"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: pool
+        - *id001
+        - *id002
+        - *id003
+      - uuid: a6743522d6f64a6fab88ae9cec47da53
+        name: 'HPE MSA: Drive {#LOCATION}: Power-on hours'
+        type: DEPENDENT
+        key: hpe.msa.drive.poweronhours[{#DISKID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["power-on-hours"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        trends: 365d
+        units: h
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: power_on_hours
+        - *id001
+        - *id002
+        - *id003
+      - uuid: 116a277996fe4812bd88cf2455ee66c8
+        name: 'HPE MSA: Drive {#LOCATION}: Average response time'
+        type: DEPENDENT
+        key: hpe.msa.drive.avgrsptime[{#DISKID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["avg-rsp-time"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        trends: 365d
+        units: ms
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: response_time
+        - *id001
+        - *id002
+        - *id003
+      - uuid: b0e25e46e23940e0a440c8d12e12b0a1
+        name: 'HPE MSA: Drive {#LOCATION}: Number of I/Os'
+        type: DEPENDENT
+        key: hpe.msa.drive.ios[{#DISKID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["number-of-ios"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        trends: 365d
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: io_count
+        - *id001
+        - *id002
+        - *id003
+      - uuid: f5fc0b3ac2f645e8b3f2bb972dc709cf
+        name: 'HPE MSA: Drive {#LOCATION}: Total data transferred'
+        type: DEPENDENT
+        key: hpe.msa.drive.data.transferred[{#DISKID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["total-data-transferred-numeric"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        trends: 365d
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: data_transferred
+        - *id001
+        - *id002
+        - *id003
+      - uuid: 42acd69c1a934d1b80b62de999fe2dc3
+        name: 'HPE MSA: Drive {#LOCATION}: SMART'
+        type: DEPENDENT
+        key: hpe.msa.drive.smart[{#DISKID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["smart"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: smart
+        - *id001
+        - *id002
+        - *id003
+      master_item:
+        key: hpe.msa.api.disks.raw
+      lld_macro_paths:
+      - lld_macro: '{#ARCHITECTURE}'
+        path: $.architecture
+      - lld_macro: '{#DISKID}'
+        path: $["durable-id"]
+      - lld_macro: '{#LOCATION}'
+        path: $.location
+      - lld_macro: '{#MODEL}'
+        path: $.model
+      - lld_macro: '{#POOL}'
+        path: $["storage-pool-name"]
+      - lld_macro: '{#SERIAL}'
+        path: $["serial-number"]
+      - lld_macro: '{#SLOT}'
+        path: $.slot
+      - lld_macro: '{#USAGE}'
+        path: $.usage
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.drives
+      description: Discovers common health and inventory metrics for all drives returned by /api/show/disks.
+    - uuid: 25a9f11190274ec689db6db4e798f302
+      name: 'HPE MSA: Discover HDD-only metrics'
+      type: DEPENDENT
+      key: hpe.msa.drive.hdd.discovery
+      lifetime: 7d
+      enabled_lifetime_type: DISABLE_AFTER
+      enabled_lifetime: 1d
+      item_prototypes:
+      - uuid: df227ada0b9b4c5cb29bb353514a4ce4
+        name: 'HPE MSA: Drive {#LOCATION}: Rotational speed class'
+        type: DEPENDENT
+        key: hpe.msa.drive.rpm[{#DISKID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["rpm"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: rpm
+        - tag: location
+          value: '{#LOCATION}'
+        - tag: architecture
+          value: '{#ARCHITECTURE}'
+        - tag: usage
+          value: '{#USAGE}'
+        description: HDD rotational speed class reported by the MSA; for example, 10 represents a 10K RPM drive.
+      master_item:
+        key: hpe.msa.api.disks.raw
+      lld_macro_paths: &id004
+      - lld_macro: '{#ARCHITECTURE}'
+        path: $.architecture
+      - lld_macro: '{#DISKID}'
+        path: $["durable-id"]
+      - lld_macro: '{#LOCATION}'
+        path: $.location
+      - lld_macro: '{#MODEL}'
+        path: $.model
+      - lld_macro: '{#POOL}'
+        path: $["storage-pool-name"]
+      - lld_macro: '{#SERIAL}'
+        path: $["serial-number"]
+      - lld_macro: '{#SLOT}'
+        path: $.slot
+      - lld_macro: '{#USAGE}'
+        path: $.usage
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.drives[?(@["architecture"]=="HDD")]
+      description: Discovers metrics that are meaningful only for rotating HDDs.
+    - uuid: 4e766f41e4184eabaec70efc3289ccd8
+      name: 'HPE MSA: Discover SSD-only metrics'
+      type: DEPENDENT
+      key: hpe.msa.drive.ssd.discovery
+      lifetime: 7d
+      enabled_lifetime_type: DISABLE_AFTER
+      enabled_lifetime: 1d
+      item_prototypes:
+      - uuid: 623a7311055b40c299fae8c3cb82c892
+        name: 'HPE MSA: Drive {#LOCATION}: SSD life remaining'
+        type: DEPENDENT
+        key: hpe.msa.drive.ssd.life[{#DISKID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.drives[?(@["durable-id"]=="{#DISKID}")]["ssd-life-left-numeric"].first()
+        master_item:
+          key: hpe.msa.api.disks.raw
+        trends: 365d
+        units: '%'
+        tags:
+        - tag: component
+          value: drive
+        - tag: metric
+          value: ssd_life
+        - tag: location
+          value: '{#LOCATION}'
+        - tag: architecture
+          value: '{#ARCHITECTURE}'
+        - tag: usage
+          value: '{#USAGE}'
+        trigger_prototypes:
+        - uuid: 87a95077a34d4df3b5382374ac928f05
+          expression: last(/HPE MSA API/hpe.msa.drive.ssd.life[{#DISKID}])<20
+          name: 'HPE MSA: SSD {#LOCATION} life remaining is below 20%'
+          priority: WARNING
+          tags:
+          - tag: component
+            value: drive
+          - tag: scope
+            value: capacity
+        description: Remaining SSD endurance in percent. This item is discovered only for SSD drives.
+      master_item:
+        key: hpe.msa.api.disks.raw
+      lld_macro_paths: *id004
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.drives[?(@["architecture"]=="SSD")]
+      description: Discovers metrics that are meaningful only for SSDs.
+    - uuid: c09cf2e2d79a473a9525b59d49d32dd7
+      name: 'HPE MSA: Discover fans'
+      type: DEPENDENT
+      key: hpe.msa.fan.discovery
+      lifetime: 7d
+      enabled_lifetime_type: DISABLE_AFTER
+      enabled_lifetime: 1d
+      item_prototypes:
+      - uuid: ea8dc8646639439ca24f088e92fbdcb4
+        name: 'HPE MSA: {#FANNAME}: Health'
+        type: DEPENDENT
+        key: hpe.msa.fan.health[{#FANID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.fans[?(@["durable-id"]=="{#FANID}")]["health-numeric"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        tags:
+        - tag: component
+          value: fan
+        - tag: metric
+          value: health
+        - &id005
+          tag: location
+          value: '{#LOCATION}'
+        - &id006
+          tag: position
+          value: '{#POSITION}'
+        trigger_prototypes:
+        - uuid: 82bfc6c5fde6478fbdf7afcffb68870f
+          expression: last(/HPE MSA API/hpe.msa.fan.health[{#FANID}])<>0
+          name: 'HPE MSA: {#FANNAME} health is not OK'
+          priority: HIGH
+          tags:
+          - tag: component
+            value: fan
+          - tag: scope
+            value: availability
+      - uuid: d7226e5081224b5687644cc01bd19fc2
+        name: 'HPE MSA: {#FANNAME}: Speed'
+        type: DEPENDENT
+        key: hpe.msa.fan.speed[{#FANID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.fans[?(@["durable-id"]=="{#FANID}")]["speed"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        units: rpm
+        tags:
+        - tag: component
+          value: fan
+        - tag: metric
+          value: speed
+        - *id005
+        - *id006
+      - uuid: 813af76ede6a4000b50dc33ee3f7cad3
+        name: 'HPE MSA: {#FANNAME}: Status'
+        type: DEPENDENT
+        key: hpe.msa.fan.status[{#FANID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.fans[?(@["durable-id"]=="{#FANID}")]["status"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: fan
+        - tag: metric
+          value: status
+        - *id005
+        - *id006
+        trigger_prototypes:
+        - uuid: df94f096c50a4248a51b6f1dec987e89
+          expression: last(/HPE MSA API/hpe.msa.fan.status[{#FANID}])<>"Up"
+          name: 'HPE MSA: {#FANNAME} status is not Up'
+          priority: HIGH
+          tags:
+          - tag: component
+            value: fan
+          - tag: scope
+            value: availability
+      master_item:
+        key: hpe.msa.api.enclosures
+      lld_macro_paths:
+      - lld_macro: '{#FANID}'
+        path: $["durable-id"]
+      - lld_macro: '{#FANNAME}'
+        path: $.name
+      - lld_macro: '{#LOCATION}'
+        path: $.location
+      - lld_macro: '{#POSITION}'
+        path: $.position
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.fans
+    - uuid: ea4975b176ac49aaac88b8e88f14ac78
+      name: 'HPE MSA: Discover power supplies'
+      type: DEPENDENT
+      key: hpe.msa.psu.discovery
+      lifetime: 7d
+      enabled_lifetime_type: DISABLE_AFTER
+      enabled_lifetime: 1d
+      item_prototypes:
+      - uuid: ff18725ee1874f279bfd4bd49796367c
+        name: 'HPE MSA: {#PSUNAME}: Health'
+        type: DEPENDENT
+        key: hpe.msa.psu.health[{#PSUID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.power_supplies[?(@["durable-id"]=="{#PSUID}")]["health-numeric"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        tags:
+        - tag: component
+          value: psu
+        - tag: metric
+          value: health
+        - &id007
+          tag: location
+          value: '{#LOCATION}'
+        trigger_prototypes:
+        - uuid: 55e9df83e76640289da224478e27b43b
+          expression: last(/HPE MSA API/hpe.msa.psu.health[{#PSUID}])<>0
+          name: 'HPE MSA: {#PSUNAME} health is not OK'
+          priority: HIGH
+          tags:
+          - tag: component
+            value: psu
+          - tag: scope
+            value: availability
+      - uuid: 1692c6dc6e7945949c4a8b9a7716d2c4
+        name: 'HPE MSA: {#PSUNAME}: Status'
+        type: DEPENDENT
+        key: hpe.msa.psu.status[{#PSUID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.power_supplies[?(@["durable-id"]=="{#PSUID}")]["status"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: psu
+        - tag: metric
+          value: status
+        - *id007
+        trigger_prototypes:
+        - uuid: 5fe9fdcae16045488c991695a838e7c5
+          expression: last(/HPE MSA API/hpe.msa.psu.status[{#PSUID}])<>"Up"
+          name: 'HPE MSA: {#PSUNAME} status is not Up'
+          priority: HIGH
+          tags:
+          - tag: component
+            value: psu
+          - tag: scope
+            value: availability
+      - uuid: 40a911cb4f80493b9298ed5fbe2e3b64
+        name: 'HPE MSA: {#PSUNAME}: Model'
+        type: DEPENDENT
+        key: hpe.msa.psu.model[{#PSUID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.power_supplies[?(@["durable-id"]=="{#PSUID}")]["model"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: psu
+        - tag: metric
+          value: model
+        - *id007
+      - uuid: 78ffa80c2e934fa0bfceb92b6e118cde
+        name: 'HPE MSA: {#PSUNAME}: Serial number'
+        type: DEPENDENT
+        key: hpe.msa.psu.serial[{#PSUID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.power_supplies[?(@["durable-id"]=="{#PSUID}")]["serial-number"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: psu
+        - tag: metric
+          value: serial
+        - *id007
+      - uuid: f02df07bac704ce3be126dbba3ca8c1d
+        name: 'HPE MSA: {#PSUNAME}: Firmware revision'
+        type: DEPENDENT
+        key: hpe.msa.psu.firmware[{#PSUID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.power_supplies[?(@["durable-id"]=="{#PSUID}")]["fw-revision"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: psu
+        - tag: metric
+          value: firmware
+        - *id007
+      master_item:
+        key: hpe.msa.api.enclosures
+      lld_macro_paths:
+      - lld_macro: '{#LOCATION}'
+        path: $.location
+      - lld_macro: '{#MODEL}'
+        path: $.model
+      - lld_macro: '{#PSUID}'
+        path: $["durable-id"]
+      - lld_macro: '{#PSUNAME}'
+        path: $.name
+      - lld_macro: '{#SERIAL}'
+        path: $["serial-number"]
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.power_supplies
+    - uuid: 5d15876b6b6946c896daaf2e6840a5a6
+      name: 'HPE MSA: Discover controllers'
+      type: DEPENDENT
+      key: hpe.msa.controller.discovery
+      lifetime: 7d
+      enabled_lifetime_type: DISABLE_AFTER
+      enabled_lifetime: 1d
+      item_prototypes:
+      - uuid: 59aeca3e88614c2182bef8298f02e709
+        name: 'HPE MSA: Controller {#CONTROLLER}: Health'
+        type: DEPENDENT
+        key: hpe.msa.controller.health[{#CTRLID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.controllers[?(@["durable-id"]=="{#CTRLID}")]["health-numeric"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        tags:
+        - tag: component
+          value: controller
+        - tag: metric
+          value: health
+        - &id008
+          tag: controller
+          value: '{#CONTROLLER}'
+        - &id009
+          tag: position
+          value: '{#POSITION}'
+        trigger_prototypes:
+        - uuid: bb9e5c93da8b4f5c8c83741416e482de
+          expression: last(/HPE MSA API/hpe.msa.controller.health[{#CTRLID}])<>0
+          name: 'HPE MSA: Controller {#CONTROLLER} health is not OK'
+          priority: DISASTER
+          tags:
+          - tag: component
+            value: controller
+          - tag: scope
+            value: availability
+      - uuid: 11d3491f9b6847a4b65cfb5a43c626b9
+        name: 'HPE MSA: Controller {#CONTROLLER}: Status'
+        type: DEPENDENT
+        key: hpe.msa.controller.status[{#CTRLID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.controllers[?(@["durable-id"]=="{#CTRLID}")]["status"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: controller
+        - tag: metric
+          value: status
+        - *id008
+        - *id009
+        trigger_prototypes:
+        - uuid: 0f8caacd000646a7b00329be03f3c400
+          expression: last(/HPE MSA API/hpe.msa.controller.status[{#CTRLID}])<>"Operational"
+          name: 'HPE MSA: Controller {#CONTROLLER} is not operational'
+          priority: HIGH
+          tags:
+          - tag: component
+            value: controller
+          - tag: scope
+            value: availability
+      - uuid: 640a8aa3d8c4441ca582a0588afecf7e
+        name: 'HPE MSA: Controller {#CONTROLLER}: Redundancy status'
+        type: DEPENDENT
+        key: hpe.msa.controller.redundancy[{#CTRLID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.controllers[?(@["durable-id"]=="{#CTRLID}")]["redundancy-status"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: controller
+        - tag: metric
+          value: redundancy
+        - *id008
+        - *id009
+        trigger_prototypes:
+        - uuid: 4378240bb60f44ae8edc3dc7c5498d79
+          expression: last(/HPE MSA API/hpe.msa.controller.redundancy[{#CTRLID}])<>"Redundant"
+          name: 'HPE MSA: Controller {#CONTROLLER} redundancy is degraded'
+          priority: HIGH
+          tags:
+          - tag: component
+            value: controller
+          - tag: scope
+            value: availability
+      - uuid: 5e1160e141c4433395849218e0d4232a
+        name: 'HPE MSA: Controller {#CONTROLLER}: Failed over'
+        type: DEPENDENT
+        key: hpe.msa.controller.failedover[{#CTRLID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.controllers[?(@["durable-id"]=="{#CTRLID}")]["failed-over"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: controller
+        - tag: metric
+          value: failover
+        - *id008
+        - *id009
+        trigger_prototypes:
+        - uuid: eb80267aaa574573a5de2aadf93cbaf1
+          expression: last(/HPE MSA API/hpe.msa.controller.failedover[{#CTRLID}])<>"No"
+          name: 'HPE MSA: Controller {#CONTROLLER} is failed over'
+          priority: HIGH
+          tags:
+          - tag: component
+            value: controller
+          - tag: scope
+            value: availability
+      - uuid: 8179549e068944b3ae6bd195f68da717
+        name: 'HPE MSA: Controller {#CONTROLLER}: Cache lock'
+        type: DEPENDENT
+        key: hpe.msa.controller.cachelock[{#CTRLID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.controllers[?(@["durable-id"]=="{#CTRLID}")]["cache-lock"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: controller
+        - tag: metric
+          value: cache_lock
+        - *id008
+        - *id009
+      - uuid: 47f5f4670c604674b273e729b33c8315
+        name: 'HPE MSA: Controller {#CONTROLLER}: Write policy'
+        type: DEPENDENT
+        key: hpe.msa.controller.writepolicy[{#CTRLID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.controllers[?(@["durable-id"]=="{#CTRLID}")]["write-policy"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: controller
+        - tag: metric
+          value: write_policy
+        - *id008
+        - *id009
+      - uuid: 731cc36b2ddd436396cfba3a7eb06b8e
+        name: 'HPE MSA: Controller {#CONTROLLER}: Firmware'
+        type: DEPENDENT
+        key: hpe.msa.controller.firmware[{#CTRLID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.controllers[?(@["durable-id"]=="{#CTRLID}")]["sc-fw"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: controller
+        - tag: metric
+          value: firmware
+        - *id008
+        - *id009
+      - uuid: 2546b584c706454aa4ec77a5d2fe464e
+        name: 'HPE MSA: Controller {#CONTROLLER}: IP address'
+        type: DEPENDENT
+        key: hpe.msa.controller.ip[{#CTRLID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.controllers[?(@["durable-id"]=="{#CTRLID}")]["ip-address"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: controller
+        - tag: metric
+          value: ip
+        - *id008
+        - *id009
+      - uuid: 7c1e0a0fd2424836929f9e8cbb6af834
+        name: 'HPE MSA: Controller {#CONTROLLER}: Cache memory'
+        type: DEPENDENT
+        key: hpe.msa.controller.cachememory[{#CTRLID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.controllers[?(@["durable-id"]=="{#CTRLID}")]["cache-memory-size"].first()
+        - type: MULTIPLIER
+          parameters:
+          - '1048576'
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        units: B
+        tags:
+        - tag: component
+          value: controller
+        - tag: metric
+          value: cache_memory
+        - *id008
+        - *id009
+        description: The API reports this value in MiB. It is converted to bytes for correct automatic display scaling.
+      - uuid: 6f18c5a2c72b4ad68c012e1ffa9cae8a
+        name: 'HPE MSA: Controller {#CONTROLLER}: System memory'
+        type: DEPENDENT
+        key: hpe.msa.controller.systemmemory[{#CTRLID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.controllers[?(@["durable-id"]=="{#CTRLID}")]["system-memory-size"].first()
+        - type: MULTIPLIER
+          parameters:
+          - '1048576'
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        units: B
+        tags:
+        - tag: component
+          value: controller
+        - tag: metric
+          value: system_memory
+        - *id008
+        - *id009
+        description: The API reports this value in MiB. It is converted to bytes for correct automatic display scaling.
+      master_item:
+        key: hpe.msa.api.enclosures
+      lld_macro_paths:
+      - lld_macro: '{#CTRLID}'
+        path: $["durable-id"]
+      - lld_macro: '{#CONTROLLER}'
+        path: $["controller-id"]
+      - lld_macro: '{#POSITION}'
+        path: $.position
+      - lld_macro: '{#MODEL}'
+        path: $.model
+      - lld_macro: '{#SERIAL}'
+        path: $["serial-number"]
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.controllers
+    - uuid: 9b352e965cad4b0fac90b8993ccfb4d0
+      name: 'HPE MSA: Discover host ports'
+      type: DEPENDENT
+      key: hpe.msa.hostport.discovery
+      lifetime: 7d
+      enabled_lifetime_type: DISABLE_AFTER
+      enabled_lifetime: 1d
+      item_prototypes:
+      - uuid: 5d127e12b34b47eab01f6b4769006d56
+        name: 'HPE MSA: Host port {#PORT}: Health'
+        type: DEPENDENT
+        key: hpe.msa.hostport.health[{#PORTID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.host_ports[?(@["durable-id"]=="{#PORTID}")]["health-numeric"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        tags:
+        - tag: component
+          value: host_port
+        - tag: metric
+          value: health
+        - &id010
+          tag: controller
+          value: '{#CONTROLLER}'
+        - &id011
+          tag: port
+          value: '{#PORT}'
+        trigger_prototypes:
+        - uuid: aaf26205c3df44ca975be554165222dc
+          expression: last(/HPE MSA API/hpe.msa.hostport.health[{#PORTID}])<>0
+          name: 'HPE MSA: Host port {#PORT} health is not OK'
+          priority: HIGH
+          tags:
+          - tag: component
+            value: host_port
+          - tag: scope
+            value: availability
+      - uuid: a7b660bdd26b47c1ab96de95ad2ad9a0
+        name: 'HPE MSA: Host port {#PORT}: Status'
+        type: DEPENDENT
+        key: hpe.msa.hostport.status[{#PORTID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.host_ports[?(@["durable-id"]=="{#PORTID}")]["status"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: host_port
+        - tag: metric
+          value: status
+        - *id010
+        - *id011
+      - uuid: d3ea1048ac844b769f16ab551fdd727a
+        name: 'HPE MSA: Host port {#PORT}: Actual speed'
+        type: DEPENDENT
+        key: hpe.msa.hostport.speed[{#PORTID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.host_ports[?(@["durable-id"]=="{#PORTID}")]["actual-speed"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: host_port
+        - tag: metric
+          value: speed
+        - *id010
+        - *id011
+      - uuid: a07eca84ce8c428f9f1c762634d508cd
+        name: 'HPE MSA: Host port {#PORT}: Target ID'
+        type: DEPENDENT
+        key: hpe.msa.hostport.targetid[{#PORTID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.host_ports[?(@["durable-id"]=="{#PORTID}")]["target-id"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: host_port
+        - tag: metric
+          value: target_id
+        - *id010
+        - *id011
+      master_item:
+        key: hpe.msa.api.enclosures
+      lld_macro_paths:
+      - lld_macro: '{#PORTID}'
+        path: $["durable-id"]
+      - lld_macro: '{#PORT}'
+        path: $.port
+      - lld_macro: '{#CONTROLLER}'
+        path: $.controller
+      - lld_macro: '{#PORTTYPE}'
+        path: $["port-type"]
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.host_ports
+    - uuid: 77a5b126a2ab4f629852394bc6c413c0
+      name: 'HPE MSA: Discover expanders'
+      type: DEPENDENT
+      key: hpe.msa.expander.discovery
+      lifetime: 7d
+      enabled_lifetime_type: DISABLE_AFTER
+      enabled_lifetime: 1d
+      item_prototypes:
+      - uuid: a9429083e171466785318296b13aa5e7
+        name: 'HPE MSA: {#EXPANDERNAME}: Health'
+        type: DEPENDENT
+        key: hpe.msa.expander.health[{#EXPANDERID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.expanders[?(@["durable-id"]=="{#EXPANDERID}")]["health-numeric"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        tags:
+        - tag: component
+          value: expander
+        - tag: metric
+          value: health
+        - &id012
+          tag: location
+          value: '{#LOCATION}'
+        trigger_prototypes:
+        - uuid: 9cc880620ac14d9f9144b2c8bc3f0052
+          expression: last(/HPE MSA API/hpe.msa.expander.health[{#EXPANDERID}])<>0
+          name: 'HPE MSA: {#EXPANDERNAME} health is not OK'
+          priority: HIGH
+          tags:
+          - tag: component
+            value: expander
+          - tag: scope
+            value: availability
+      - uuid: 366e75b8451d4d43a0a1fa336aa5f615
+        name: 'HPE MSA: {#EXPANDERNAME}: Status'
+        type: DEPENDENT
+        key: hpe.msa.expander.status[{#EXPANDERID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.expanders[?(@["durable-id"]=="{#EXPANDERID}")]["status"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: expander
+        - tag: metric
+          value: status
+        - *id012
+      - uuid: 5dbbda1942fb4089bd4f045f672b5c93
+        name: 'HPE MSA: {#EXPANDERNAME}: Firmware'
+        type: DEPENDENT
+        key: hpe.msa.expander.firmware[{#EXPANDERID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.expanders[?(@["durable-id"]=="{#EXPANDERID}")]["fw-revision"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: expander
+        - tag: metric
+          value: firmware
+        - *id012
+      master_item:
+        key: hpe.msa.api.enclosures
+      lld_macro_paths:
+      - lld_macro: '{#EXPANDERID}'
+        path: $["durable-id"]
+      - lld_macro: '{#EXPANDERNAME}'
+        path: $.name
+      - lld_macro: '{#LOCATION}'
+        path: $.location
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.expanders
+    - uuid: 6ff8aa04545948c297ade9d43d65fa15
+      name: 'HPE MSA: Discover enclosures'
+      type: DEPENDENT
+      key: hpe.msa.enclosure.discovery
+      lifetime: 7d
+      enabled_lifetime_type: DISABLE_AFTER
+      enabled_lifetime: 1d
+      item_prototypes:
+      - uuid: 46d3f5e6a9d844f7abe58e49e2af540b
+        name: 'HPE MSA: Enclosure {#ENCLOSURE}: Health'
+        type: DEPENDENT
+        key: hpe.msa.enclosure.health[{#ENCLOSUREID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.enclosures[?(@["durable-id"]=="{#ENCLOSUREID}")]["health-numeric"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        tags:
+        - tag: component
+          value: enclosure
+        - tag: metric
+          value: health
+        - &id013
+          tag: enclosure
+          value: '{#ENCLOSURE}'
+        trigger_prototypes:
+        - uuid: 1d605bfd0066446da8155c1baf716cb4
+          expression: last(/HPE MSA API/hpe.msa.enclosure.health[{#ENCLOSUREID}])<>0
+          name: 'HPE MSA: Enclosure {#ENCLOSURE} health is not OK'
+          priority: DISASTER
+          tags:
+          - tag: component
+            value: enclosure
+          - tag: scope
+            value: availability
+      - uuid: b9acdc62de3148f8b9fc6b6ac6aa002c
+        name: 'HPE MSA: Enclosure {#ENCLOSURE}: Status'
+        type: DEPENDENT
+        key: hpe.msa.enclosure.status[{#ENCLOSUREID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.enclosures[?(@["durable-id"]=="{#ENCLOSUREID}")]["status"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: enclosure
+        - tag: metric
+          value: status
+        - *id013
+      - uuid: 6f6ea42fb04c4e9eb277b66c35c8155d
+        name: 'HPE MSA: Enclosure {#ENCLOSURE}: Power consumption'
+        type: DEPENDENT
+        key: hpe.msa.enclosure.power[{#ENCLOSUREID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.enclosures[?(@["durable-id"]=="{#ENCLOSUREID}")]["enclosure-power"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        units: W
+        tags:
+        - tag: component
+          value: enclosure
+        - tag: metric
+          value: power
+        - *id013
+      - uuid: 1df3df6258ea4b9ba3b9c19e1241fd4f
+        name: 'HPE MSA: Enclosure {#ENCLOSURE}: Model'
+        type: DEPENDENT
+        key: hpe.msa.enclosure.model[{#ENCLOSUREID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.enclosures[?(@["durable-id"]=="{#ENCLOSUREID}")]["model"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: enclosure
+        - tag: metric
+          value: model
+        - *id013
+      - uuid: e711d41c777243d3b444fa6421a63187
+        name: 'HPE MSA: Enclosure {#ENCLOSURE}: Serial number'
+        type: DEPENDENT
+        key: hpe.msa.enclosure.serial[{#ENCLOSUREID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.enclosures[?(@["durable-id"]=="{#ENCLOSUREID}")]["midplane-serial-number"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: enclosure
+        - tag: metric
+          value: serial
+        - *id013
+      - uuid: 8a57670825f64754a809e7c8d4680696
+        name: 'HPE MSA: Enclosure {#ENCLOSURE}: Disk count'
+        type: DEPENDENT
+        key: hpe.msa.enclosure.disks[{#ENCLOSUREID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.enclosures[?(@["durable-id"]=="{#ENCLOSUREID}")]["number-of-disks"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        tags:
+        - tag: component
+          value: enclosure
+        - tag: metric
+          value: disk_count
+        - *id013
+      - uuid: 3d9b4247f9b24d51885d6f7aecb59d3a
+        name: 'HPE MSA: Enclosure {#ENCLOSURE}: Fan count'
+        type: DEPENDENT
+        key: hpe.msa.enclosure.fans[{#ENCLOSUREID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.enclosures[?(@["durable-id"]=="{#ENCLOSUREID}")]["number-of-coolings-elements"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        tags:
+        - tag: component
+          value: enclosure
+        - tag: metric
+          value: fan_count
+        - *id013
+      - uuid: abf08f9051d34692a06c0908f1536a2a
+        name: 'HPE MSA: Enclosure {#ENCLOSURE}: PSU count'
+        type: DEPENDENT
+        key: hpe.msa.enclosure.psus[{#ENCLOSUREID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.enclosures[?(@["durable-id"]=="{#ENCLOSUREID}")]["number-of-power-supplies"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        tags:
+        - tag: component
+          value: enclosure
+        - tag: metric
+          value: psu_count
+        - *id013
+      master_item:
+        key: hpe.msa.api.enclosures
+      lld_macro_paths:
+      - lld_macro: '{#ENCLOSUREID}'
+        path: $["durable-id"]
+      - lld_macro: '{#ENCLOSURE}'
+        path: $["enclosure-id"]
+      - lld_macro: '{#MODEL}'
+        path: $.model
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.enclosures
+    - uuid: 6ab339d426cb41aa8275ea0c2d380a4a
+      name: 'HPE MSA: Discover management ports'
+      type: DEPENDENT
+      key: hpe.msa.mgmt.discovery
+      lifetime: 7d
+      enabled_lifetime_type: DISABLE_AFTER
+      enabled_lifetime: 1d
+      item_prototypes:
+      - uuid: bd302f7aaa21450c8a876613b65d02b7
+        name: 'HPE MSA: Management port {#MGMTID}: Health'
+        type: DEPENDENT
+        key: hpe.msa.mgmt.health[{#MGMTID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.management_ports[?(@["durable-id"]=="{#MGMTID}")]["health-numeric"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        trends: 365d
+        tags:
+        - tag: component
+          value: management_port
+        - tag: metric
+          value: health
+        trigger_prototypes:
+        - uuid: 98df0287fc5445069bea59416f06e95c
+          expression: last(/HPE MSA API/hpe.msa.mgmt.health[{#MGMTID}])<>0
+          name: 'HPE MSA: Management port {#MGMTID} health is not OK'
+          priority: WARNING
+          tags:
+          - tag: component
+            value: management_port
+          - tag: scope
+            value: availability
+      - uuid: 3ebc097663f64316bc3205f7a6627c37
+        name: 'HPE MSA: Management port {#MGMTID}: Link speed'
+        type: DEPENDENT
+        key: hpe.msa.mgmt.speed[{#MGMTID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.management_ports[?(@["durable-id"]=="{#MGMTID}")]["link-speed"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: management_port
+        - tag: metric
+          value: speed
+      - uuid: 61d43121ef314feebdbc14f2dc0ed975
+        name: 'HPE MSA: Management port {#MGMTID}: Duplex'
+        type: DEPENDENT
+        key: hpe.msa.mgmt.duplex[{#MGMTID}]
+        history: 31d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.management_ports[?(@["durable-id"]=="{#MGMTID}")]["duplex-mode"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: management_port
+        - tag: metric
+          value: duplex
+      - uuid: ee7c9ab655ad43b68d27e6840f17c0e2
+        name: 'HPE MSA: Management port {#MGMTID}: IP address'
+        type: DEPENDENT
+        key: hpe.msa.mgmt.ip[{#MGMTID}]
+        history: 7d
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.management_ports[?(@["durable-id"]=="{#MGMTID}")]["ip-address"].first()
+        master_item:
+          key: hpe.msa.api.enclosures
+        value_type: TEXT
+        tags:
+        - tag: component
+          value: management_port
+        - tag: metric
+          value: ip
+      master_item:
+        key: hpe.msa.api.enclosures
+      lld_macro_paths:
+      - lld_macro: '{#MGMTID}'
+        path: $["durable-id"]
+      - lld_macro: '{#IP}'
+        path: $["ip-address"]
+      - lld_macro: '{#MAC}'
+        path: $["mac-address"]
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.management_ports
+    macros:
+    - macro: '{$HPE.MSA.API.HOST}'
+      description: MSA management hostname or IP address.
+    - macro: '{$HPE.MSA.API.PASSWORD}'
+      type: SECRET_TEXT
+      description: MSA API password.
+    - macro: '{$HPE.MSA.API.PORT}'
+      value: '443'
+    - macro: '{$HPE.MSA.API.SCHEME}'
+      value: https
+    - macro: '{$HPE.MSA.API.USER}'
+      value: Administrator
+    - macro: '{$HPE.MSA.DRIVE.TEMP.WARN}'
+      value: '55'
+      description: Drive temperature warning threshold in °C.
+    - macro: '{$HPE.MSA.DRIVE.TEMP.CRIT}'
+      value: '60'
+      description: Drive temperature critical threshold in °C.
+    - macro: '{$HPE.MSA.API.NODATA}'
+      value: 10m
+      description: Time without successful API data before an availability problem is raised.
+    - macro: '{$HPE.MSA.ALERT.NODATA}'
+      value: 15m
+      description: Time without alert API data before an alert-endpoint problem is raised.
+    tags:
+    - tag: class
+      value: storage
+    - tag: target
+      value: hpe_msa
+    vendor:
+      name: Community
+      version: 1.0.0
+    readme: |
+      ## Overview
+
+      Native Zabbix monitoring for HPE MSA storage systems using the management WBI API.
+
+      Release: 1.0.0 (Zabbix 7.4).
+
+      ### Required host macros
+
+      - `{$HPE.MSA.API.HOST}` - MSA management hostname or IP
+      - `{$HPE.MSA.API.USER}` - API/WebUI user
+      - `{$HPE.MSA.API.PASSWORD}` - password, preferably Secret text
+
+      Defaults: HTTPS, TCP 443, five-minute polling.
+
+      ### Scope
+
+      The template focuses on availability and health: drives, controllers, fans, PSUs, enclosures,
+      host and management ports, expanders, active alerts and API reachability.
+
+      ### Notes
+
+      - The MSA returns `255` for SSD lifetime on HDDs. HDD and SSD-only metrics are discovered separately.
+      - Informational unresolved alerts are collected but do not trigger a problem.
+      - ICMP is checked against `{$HPE.MSA.API.HOST}`. Disable the ping item if ICMP is intentionally blocked.
