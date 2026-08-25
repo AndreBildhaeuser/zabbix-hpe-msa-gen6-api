@@ -219,18 +219,39 @@ The generated problems automatically recovered after the MSA returned to a healt
 4. Select **Import**.
 5. Import the YAML template.
 6. Link the template to the HPE MSA host.
-7. Configure the required template macros for the MSA management address and API credentials.
+7. Configure `{$HPE.MSA.API.HOST}`, `{$HPE.MSA.API.USER}` and `{$HPE.MSA.API.PASSWORD}` on the HPE MSA host (see [Configuration macros](#configuration-macros)).
 8. Wait for the first discovery cycle.
 
 Zabbix will then automatically discover the available MSA hardware and create the corresponding items and triggers.
 
-## Template macros
+## Configuration macros
 
-The template uses macros for the HPE MSA API connection and configurable monitoring thresholds.
+After linking the template to the HPE MSA host, configure the following
+host-specific macros:
 
-API credentials should be configured on the host whenever possible rather than modifying the template itself.
+**Data collection → Hosts → your HPE MSA host → Macros**
 
-The password macro is defined as a secret value.
+| Macro | Required | Description |
+|---|:---:|---|
+| `{$HPE.MSA.API.HOST}` | **Yes** | MSA management hostname or IP address. |
+| `{$HPE.MSA.API.USER}` | **Yes** | MSA API username. A dedicated monitoring account with the minimum required permissions is recommended. |
+| `{$HPE.MSA.API.PASSWORD}` | **Yes** | Password for the MSA API user. Store as **Secret text**. |
+
+### Optional settings
+
+The following macros have sensible defaults in the template and normally
+do not need to be configured on the host:
+
+| Macro | Default | Description |
+|---|---:|---|
+| `{$HPE.MSA.API.PORT}` | `443` | TCP port used for the MSA API connection. |
+| `{$HPE.MSA.API.SCHEME}` | `https` | Protocol used for the MSA API connection. |
+| `{$HPE.MSA.API.NODATA}` | `10m` | Time without successful API data before an availability problem is raised. |
+| `{$HPE.MSA.ALERT.NODATA}` | `15m` | Time without alert API data before an alert-endpoint problem is raised. |
+| `{$HPE.MSA.DRIVE.TEMP.WARN}` | `55` | Drive temperature warning threshold in °C. |
+| `{$HPE.MSA.DRIVE.TEMP.CRIT}` | `60` | Drive temperature critical threshold in °C. |
+
+Host-level macro values override the defaults inherited from the template.
 
 ## Design philosophy
 
